@@ -26,7 +26,6 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <math.h>
-#include <type_traits>
 #include <I2Cdev.h>
 #include <MPU6050.h>
 #include "MS5611.h"
@@ -70,76 +69,14 @@ MPU6050 imu(MPU6050_I2C_ADDRESS);
 MS5611 ms5611;
 
 // ---------------------------------------------------------------------------
-// Helper templates to gracefully support multiple MS5611 library variants
+// MS5611 helper
 // ---------------------------------------------------------------------------
-inline bool interpretMs5611Result(bool result) { return result; }
-inline bool interpretMs5611Result(int result) { return (result == 0) || (result > 0); }
-inline bool interpretMs5611Result(uint8_t result) { return (result == 0) || (result == 1); }
-inline bool interpretMs5611Result(float) { return true; }
-template <typename T>
-inline bool interpretMs5611Result(T) { return true; }
-
-template <typename Sensor>
-auto ms5611SetAddressIfAvailable(Sensor &sensor, uint8_t address, int)
-    -> decltype(sensor.setAddress(address), void()) {
-  sensor.setAddress(address);
-}
-template <typename Sensor>
-void ms5611SetAddressIfAvailable(Sensor &, uint8_t, ...) {}
-
-template <typename Sensor, typename Oversample>
-auto ms5611SetOversamplingIfAvailable(Sensor &sensor, Oversample value, int)
-    -> decltype(sensor.setOversampling(value), void()) {
-  sensor.setOversampling(value);
-}
-template <typename Sensor, typename Oversample>
-void ms5611SetOversamplingIfAvailable(Sensor &, Oversample, ...) {}
-
-template <typename Sensor>
-bool ms5611BeginDispatchAddr(Sensor &sensor, uint8_t address, std::false_type) {
-  return interpretMs5611Result(sensor.begin(address));
-}
-template <typename Sensor>
-bool ms5611BeginDispatchAddr(Sensor &sensor, uint8_t address, std::true_type) {
-  (void)address;
-  sensor.begin(address);
-  return true;
-}
-template <typename Sensor>
-auto ms5611Begin(Sensor &sensor, uint8_t address, int)
-    -> decltype(sensor.begin(address), bool()) {
-  typedef typename std::is_void<decltype(sensor.begin(address))>::type IsVoid;
-  return ms5611BeginDispatchAddr(sensor, address, IsVoid{});
-}
-
-template <typename Sensor>
-bool ms5611BeginDispatchNoAddr(Sensor &sensor, std::false_type) {
-  return interpretMs5611Result(sensor.begin());
-}
-template <typename Sensor>
-bool ms5611BeginDispatchNoAddr(Sensor &sensor, std::true_type) {
-  sensor.begin();
-  return true;
-}
-template <typename Sensor>
-bool ms5611Begin(Sensor &sensor, uint8_t, ...) {
-  typedef typename std::is_void<decltype(sensor.begin())>::type IsVoid;
-  return ms5611BeginDispatchNoAddr(sensor, IsVoid{});
-}
-
-template <typename Sensor>
-bool ms5611ReadDispatch(Sensor &sensor, std::false_type) {
-  return interpretMs5611Result(sensor.read());
-}
-template <typename Sensor>
-bool ms5611ReadDispatch(Sensor &sensor, std::true_type) {
-  sensor.read();
-  return true;
-}
-template <typename Sensor>
-bool ms5611Read(Sensor &sensor) {
-  typedef typename std::is_void<decltype(sensor.read())>::type IsVoid;
-  return ms5611ReadDispatch(sensor, IsVoid{});
+bool ms5611ReadOk() {
+#ifdef MS5611_OK
+  return ms5611.read() == MS5611_OK;
+#else
+  return ms5611.read();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -250,18 +187,17 @@ void readImuSample(ImuRawSample &sample) {
 }
 
 bool initBarometer() {
-  ms5611SetAddressIfAvailable(ms5611, MS5611_I2C_ADDRESS, 0);
-  bool ok = ms5611Begin(ms5611, MS5611_I2C_ADDRESS, 0);
+  bool ok = ms5611.begin(MS5611_I2C_ADDRESS);
 #if defined(MS5611_OSR_ULTRA_HIGH)
-  ms5611SetOversamplingIfAvailable(ms5611, MS5611_OSR_ULTRA_HIGH, 0);
+  ms5611.setOversampling(MS5611_OSR_ULTRA_HIGH);
 #elif defined(MS5611_ULTRA_HIGH)
-  ms5611SetOversamplingIfAvailable(ms5611, MS5611_ULTRA_HIGH, 0);
+  ms5611.setOversampling(MS5611_ULTRA_HIGH);
 #endif
   float pressureSum = 0.0f;
   float tempSum = 0.0f;
   const int samples = 20;
   for (int i = 0; i < samples; ++i) {
-    if (ms5611Read(ms5611)) {
+    if (ms5611ReadOk()) {
       pressureSum += toPascal(ms5611.getPressure());
       tempSum += ms5611.getTemperature();
     }
@@ -350,7 +286,7 @@ void updateBarometer() {
   }
   lastBaroSampleMillis = now;
 
-  if (ms5611Read(ms5611)) {
+  if (ms5611ReadOk()) {
     float pressurePa = toPascal(ms5611.getPressure());
     lastTemperatureC = ms5611.getTemperature();
     if (pressurePa > 10000.0f) {
