@@ -45,6 +45,7 @@ const uint8_t PIN_POT_2 = A7;
 RF24 radio(PIN_RF_CE, PIN_RF_CSN);
 const byte RADIO_ADDRESS_TX[6] = "DRN1";
 const byte RADIO_ADDRESS_RX[6] = "RC01";
+const uint8_t RADIO_CHANNEL = 115; // must match flight controller
 
 template <typename T>
 T clamp(T value, T minVal, T maxVal) {
@@ -133,7 +134,7 @@ void initInputs() {
 void initRadio() {
   radio.begin();
   radio.setDataRate(RF24_250KBPS);
-  radio.setChannel(115);
+  radio.setChannel(RADIO_CHANNEL);
   radio.setPALevel(RF24_PA_LOW);
   radio.setAutoAck(true);
   radio.openWritingPipe(RADIO_ADDRESS_TX);

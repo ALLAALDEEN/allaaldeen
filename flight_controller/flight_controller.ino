@@ -3,24 +3,33 @@
  * --------------------------------
  * Target board : Arduino Nano (ATmega328P @16MHz)
  * Radio        : nRF24L01+  (CE=D4, CSN=D10)
- * IMU          : MPU6050    (INT=D2)
- * Barometer    : GY-63 MS5611 (I2C)
+ * IMU          : MPU6050    (INT=D2, I2C=A4/A5)
+ * Barometer    : GY-63 MS5611 (I2C=A4/A5)
  * Motors       : FL=D3, FR=D5, RR=D6, RL=D7 (via ESCs)
  * Buzzer       : D8  (active low)
  * Status LED   : D13 (built-in LED)  <-- D7 reserved for rear-left motor PWM
  *
- * Libraries required:
+ * Libraries required (Arduino Library Manager):
  * - RF24 by TMRh20
  * - Servo (built-in)
+ * - I2Cdevlib - MPU6050 (by Electronic Cats / Jeff Rowberg)
+ * - I2Cdevlib - I2Cdev (dependency for the above)
+ * - MS5611 by Rob Tillaart (or compatible "MS5611.h" interface)
  *
- * This sketch implements a basic PID flight controller with complementary-filter
- * attitude estimation and a simple altitude trend estimate. It expects a matching
- * RC transmitter sketch that sends the RcPacket structure defined below.
+ * This sketch implements a PID flight controller with complementary-filter
+ * attitude estimation using the MPU6050 library and barometric altitude trending
+ * via the MS5611 library. It expects an RC transmitter that sends the RcPacket
+ * defined below over the nRF24L01+.
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <math.h>
+#include <type_traits>
+#include <I2Cdev.h>
+#include <MPU6050.h>
+#include "MS5611.h"
 #include <RF24.h>
 #include <Servo.h>
 
@@ -42,9 +51,21 @@ const uint8_t PIN_STATUS_LED = LED_BUILTIN; // D13 on Nano
 // ---------------------------------------------------------------------------
 // Radio configuration
 // ---------------------------------------------------------------------------
+const uint8_t RADIO_CHANNEL = 115; // ensure RC transmitter matches this channel
 RF24 radio(PIN_RF_CE, PIN_RF_CSN);
 const byte RADIO_ADDRESS_RX[6] = "DRN1";
 const byte RADIO_ADDRESS_TX[6] = "RC01";
+
+// I2C addresses (AD0 on MPU6050 low -> 0x68, CSB on MS5611 high -> 0x77)
+const uint8_t MPU6050_I2C_ADDRESS = 0x68;
+#if defined(MS5611_ADDRESS_HIGH)
+const uint8_t MS5611_I2C_ADDRESS = MS5611_ADDRESS_HIGH;
+#else
+const uint8_t MS5611_I2C_ADDRESS = 0x77;
+#endif
+
+MPU6050 imu(MPU6050_I2C_ADDRESS);
+MS5611 ms5611;
 
 struct __attribute__((packed)) RcPacket {
   uint32_t sequence;
@@ -59,42 +80,91 @@ struct __attribute__((packed)) RcPacket {
   uint16_t checksum;
 };
 
-volatile bool imuDataReady = false;
+// ---------------------------------------------------------------------------
+// Helper templates to gracefully support multiple MS5611 library variants
+// ---------------------------------------------------------------------------
+inline bool interpretMs5611Result(bool result) { return result; }
+inline bool interpretMs5611Result(int result) { return (result == 0) || (result > 0); }
+inline bool interpretMs5611Result(uint8_t result) { return (result == 0) || (result == 1); }
+inline bool interpretMs5611Result(float) { return true; }
+template <typename T>
+inline bool interpretMs5611Result(T) { return true; }
+
+template <typename Sensor>
+auto ms5611SetAddressIfAvailable(Sensor &sensor, uint8_t address, int)
+    -> decltype(sensor.setAddress(address), void()) {
+  sensor.setAddress(address);
+}
+template <typename Sensor>
+void ms5611SetAddressIfAvailable(Sensor &, uint8_t, ...) {}
+
+template <typename Sensor, typename Oversample>
+auto ms5611SetOversamplingIfAvailable(Sensor &sensor, Oversample value, int)
+    -> decltype(sensor.setOversampling(value), void()) {
+  sensor.setOversampling(value);
+}
+template <typename Sensor, typename Oversample>
+void ms5611SetOversamplingIfAvailable(Sensor &, Oversample, ...) {}
+
+template <typename Sensor>
+bool ms5611BeginDispatchAddr(Sensor &sensor, uint8_t address, std::false_type) {
+  return interpretMs5611Result(sensor.begin(address));
+}
+template <typename Sensor>
+bool ms5611BeginDispatchAddr(Sensor &sensor, uint8_t address, std::true_type) {
+  (void)address;
+  sensor.begin(address);
+  return true;
+}
+template <typename Sensor>
+auto ms5611Begin(Sensor &sensor, uint8_t address, int)
+    -> decltype(sensor.begin(address), bool()) {
+  typedef typename std::is_void<decltype(sensor.begin(address))>::type IsVoid;
+  return ms5611BeginDispatchAddr(sensor, address, IsVoid{});
+}
+
+template <typename Sensor>
+bool ms5611BeginDispatchNoAddr(Sensor &sensor, std::false_type) {
+  return interpretMs5611Result(sensor.begin());
+}
+template <typename Sensor>
+bool ms5611BeginDispatchNoAddr(Sensor &sensor, std::true_type) {
+  sensor.begin();
+  return true;
+}
+template <typename Sensor>
+bool ms5611Begin(Sensor &sensor, uint8_t, ...) {
+  typedef typename std::is_void<decltype(sensor.begin())>::type IsVoid;
+  return ms5611BeginDispatchNoAddr(sensor, IsVoid{});
+}
+
+template <typename Sensor>
+bool ms5611ReadDispatch(Sensor &sensor, std::false_type) {
+  return interpretMs5611Result(sensor.read());
+}
+template <typename Sensor>
+bool ms5611ReadDispatch(Sensor &sensor, std::true_type) {
+  sensor.read();
+  return true;
+}
+template <typename Sensor>
+bool ms5611Read(Sensor &sensor) {
+  typedef typename std::is_void<decltype(sensor.read())>::type IsVoid;
+  return ms5611ReadDispatch(sensor, IsVoid{});
+}
 
 // ---------------------------------------------------------------------------
-// Sensor helpers (MPU6050 + MS5611)
+// Sensor constants and state
 // ---------------------------------------------------------------------------
-namespace imu {
-constexpr uint8_t ADDRESS = 0x68;
 constexpr float ACCEL_SCALE = 16384.0f; // LSB/g for +/-2g
 constexpr float GYRO_SCALE = 131.0f;    // LSB/(deg/s) for +/-250 deg/s
 
-struct Sample {
+struct ImuRawSample {
   int16_t ax, ay, az;
   int16_t gx, gy, gz;
 };
-} // namespace imu
 
-namespace baro {
-constexpr uint8_t ADDRESS = 0x77;
-constexpr uint8_t CMD_RESET = 0x1E;
-constexpr uint8_t CMD_PROM_BASE = 0xA2; // C1..C6
-constexpr uint8_t CMD_CONVERT_D1 = 0x48; // OSR=4096
-constexpr uint8_t CMD_CONVERT_D2 = 0x58; // OSR=4096
-constexpr uint8_t CMD_READ_ADC = 0x00;
-
-struct Calibration {
-  uint16_t c1_sens;
-  uint16_t c2_off;
-  uint16_t c3_tcs;
-  uint16_t c4_tco;
-  uint16_t c5_tref;
-  uint16_t c6_tempsens;
-};
-} // namespace baro
-
-imu::Sample imuRaw{};
-baro::Calibration baroCal{};
+ImuRawSample imuRaw{};
 
 float gyroBiasX = 0.0f, gyroBiasY = 0.0f, gyroBiasZ = 0.0f;
 float accelBiasX = 0.0f, accelBiasY = 0.0f, accelBiasZ = 0.0f;
@@ -106,7 +176,8 @@ float yawRate = 0.0f;    // deg/s (integrated yaw not used for control)
 
 // Altitude estimate
 float altitudeMeters = 0.0f;
-float basePressure = 101325.0f; // Pa
+float basePressurePa = 101325.0f;
+float lastTemperatureC = 20.0f;
 
 // ---------------------------------------------------------------------------
 // Motor control
@@ -140,9 +211,7 @@ PIDState yawPid{2.0f, 0.0f, 10.0f, 0.0f, 0.0f};
 RcPacket rcPacket{};
 uint32_t lastPacketMicros = 0;
 uint32_t lastBlinkMillis = 0;
-uint32_t lastBaroConversionMillis = 0;
-bool baroRequestingPressure = true;
-uint32_t baroLastRaw = 0;
+uint32_t lastBaroSampleMillis = 0;
 
 // ---------------------------------------------------------------------------
 // Utility
@@ -162,6 +231,14 @@ template <typename T> T clamp(T value, T minVal, T maxVal) {
   return value;
 }
 
+float toPascal(float pressureReading) {
+  // Most MS5611 libraries return hPa (mbar). If already Pa, leave unchanged.
+  if (pressureReading < 2000.0f) {
+    return pressureReading * 100.0f;
+  }
+  return pressureReading;
+}
+
 void writeMotorsMicroseconds(float fl, float fr, float rr, float rl) {
   motorFL.writeMicroseconds(static_cast<int>(clamp(fl, SERVO_MIN_US, SERVO_MAX_US)));
   motorFR.writeMicroseconds(static_cast<int>(clamp(fr, SERVO_MIN_US, SERVO_MAX_US)));
@@ -178,119 +255,45 @@ void setBuzzer(bool on) {
 }
 
 // ---------------------------------------------------------------------------
-// Sensor low-level functions
+// Sensor helpers
 // ---------------------------------------------------------------------------
-void imuWriteByte(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(imu::ADDRESS);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission(true);
+bool initImu() {
+  imu.initialize();
+  imu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  imu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  imu.setDLPFMode(MPU6050_DLPF_BW_42);
+  return imu.testConnection();
 }
 
-void imuReadBytes(uint8_t reg, uint8_t count, uint8_t *dest) {
-  Wire.beginTransmission(imu::ADDRESS);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(imu::ADDRESS, count, true);
-  for (uint8_t i = 0; i < count && Wire.available(); ++i) {
-    dest[i] = Wire.read();
-  }
+void readImuSample(ImuRawSample &sample) {
+  imu.getMotion6(&sample.ax, &sample.ay, &sample.az, &sample.gx, &sample.gy, &sample.gz);
 }
 
-bool imuInit() {
-  imuWriteByte(0x6B, 0x00); // Wake up, use internal oscillator
-  delay(100);
-  imuWriteByte(0x1B, 0x00); // Gyro +/-250 deg/s
-  imuWriteByte(0x1C, 0x00); // Accel +/-2 g
-  imuWriteByte(0x1A, 0x03); // DLPF ~43 Hz
-  return true;
-}
-
-void imuReadSample(imu::Sample &sample) {
-  uint8_t buffer[14];
-  imuReadBytes(0x3B, 14, buffer);
-  sample.ax = (buffer[0] << 8) | buffer[1];
-  sample.ay = (buffer[2] << 8) | buffer[3];
-  sample.az = (buffer[4] << 8) | buffer[5];
-  sample.gx = (buffer[8] << 8) | buffer[9];
-  sample.gy = (buffer[10] << 8) | buffer[11];
-  sample.gz = (buffer[12] << 8) | buffer[13];
-}
-
-void baroWrite(uint8_t cmd) {
-  Wire.beginTransmission(baro::ADDRESS);
-  Wire.write(cmd);
-  Wire.endTransmission();
-}
-
-uint32_t baroReadADC() {
-  Wire.beginTransmission(baro::ADDRESS);
-  Wire.write(baro::CMD_READ_ADC);
-  Wire.endTransmission();
-  Wire.requestFrom(baro::ADDRESS, (uint8_t)3);
-  uint32_t value = 0;
-  if (Wire.available() == 3) {
-    value = (uint32_t)Wire.read() << 16;
-    value |= (uint32_t)Wire.read() << 8;
-    value |= Wire.read();
-  }
-  return value;
-}
-
-bool baroInit() {
-  baroWrite(baro::CMD_RESET);
-  delay(4);
-  Wire.beginTransmission(baro::ADDRESS);
-  for (uint8_t i = 0; i < 6; ++i) {
-    Wire.write(baro::CMD_PROM_BASE + i * 2);
-    Wire.endTransmission(false);
-    Wire.requestFrom(baro::ADDRESS, (uint8_t)2);
-    if (Wire.available() == 2) {
-      uint16_t value = (Wire.read() << 8) | Wire.read();
-      switch (i) {
-        case 0: baroCal.c1_sens = value; break;
-        case 1: baroCal.c2_off = value; break;
-        case 2: baroCal.c3_tcs = value; break;
-        case 3: baroCal.c4_tco = value; break;
-        case 4: baroCal.c5_tref = value; break;
-        case 5: baroCal.c6_tempsens = value; break;
-      }
+bool initBarometer() {
+  ms5611SetAddressIfAvailable(ms5611, MS5611_I2C_ADDRESS, 0);
+  bool ok = ms5611Begin(ms5611, MS5611_I2C_ADDRESS, 0);
+#if defined(MS5611_OSR_ULTRA_HIGH)
+  ms5611SetOversamplingIfAvailable(ms5611, MS5611_OSR_ULTRA_HIGH, 0);
+#elif defined(MS5611_ULTRA_HIGH)
+  ms5611SetOversamplingIfAvailable(ms5611, MS5611_ULTRA_HIGH, 0);
+#endif
+  float pressureSum = 0.0f;
+  float tempSum = 0.0f;
+  const int samples = 20;
+  for (int i = 0; i < samples; ++i) {
+    if (ms5611Read(ms5611)) {
+      pressureSum += toPascal(ms5611.getPressure());
+      tempSum += ms5611.getTemperature();
     }
+    delay(10);
   }
-  baroWrite(baro::CMD_CONVERT_D1);
-  lastBaroConversionMillis = millis();
-  baroRequestingPressure = true;
-  return true;
-}
-
-float baroCalculateAltitude(uint32_t d1, uint32_t d2) {
-  // Calibration algorithm from datasheet
-  int32_t dT = (int32_t)d2 - ((int32_t)baroCal.c5_tref << 8);
-  int64_t OFF = ((int64_t)baroCal.c2_off << 16) + ((int64_t)baroCal.c4_tco * dT) / 128;
-  int64_t SENS = ((int64_t)baroCal.c1_sens << 15) + ((int64_t)baroCal.c3_tcs * dT) / 256;
-  int32_t TEMP = 2000 + ((int64_t)dT * baroCal.c6_tempsens) / 8388608;
-
-  int32_t T2 = 0;
-  int64_t OFF2 = 0;
-  int64_t SENS2 = 0;
-  if (TEMP < 2000) {
-    T2 = (dT * dT) >> 31;
-    OFF2 = 5LL * ((TEMP - 2000) * (TEMP - 2000)) >> 1;
-    SENS2 = 5LL * ((TEMP - 2000) * (TEMP - 2000)) >> 2;
-    if (TEMP < -1500) {
-      OFF2 += 7LL * ((TEMP + 1500) * (TEMP + 1500));
-      SENS2 += 11LL * ((TEMP + 1500) * (TEMP + 1500)) >> 1;
-    }
+  if (pressureSum > 0.0f) {
+    basePressurePa = pressureSum / samples;
   }
-  TEMP -= T2;
-  OFF -= OFF2;
-  SENS -= SENS2;
-
-  int32_t P = (((int64_t)d1 * SENS) / 2097152 - OFF) / 32768;
-  float pressure = P; // Pa
-  // Barometric formula (approx)
-  float altitude = 44330.0f * (1.0f - pow(pressure / basePressure, 0.1903f));
-  return altitude;
+  if (tempSum > 0.0f) {
+    lastTemperatureC = tempSum / samples;
+  }
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +304,7 @@ void calibrateIMU() {
   float gx = 0.0f, gy = 0.0f, gz = 0.0f;
   float ax = 0.0f, ay = 0.0f, az = 0.0f;
   for (int i = 0; i < samples; ++i) {
-    imuReadSample(imuRaw);
+    readImuSample(imuRaw);
     gx += imuRaw.gx;
     gy += imuRaw.gy;
     gz += imuRaw.gz;
@@ -315,13 +318,13 @@ void calibrateIMU() {
   gyroBiasZ = gz / samples;
   accelBiasX = ax / samples;
   accelBiasY = ay / samples;
-  accelBiasZ = az / samples - imu::ACCEL_SCALE; // assume +1g on Z
+  accelBiasZ = az / samples - ACCEL_SCALE; // assume +1g on Z
 }
 
 void initRadio() {
   radio.begin();
   radio.setDataRate(RF24_250KBPS);
-  radio.setChannel(115);
+  radio.setChannel(RADIO_CHANNEL);
   radio.setPALevel(RF24_PA_LOW);
   radio.setAutoAck(true);
   radio.enableAckPayload();
@@ -343,14 +346,14 @@ float runPid(PIDState &pid, float error, float dt, float iLimit, float outputLim
 }
 
 void updateAttitude(float dt) {
-  imuReadSample(imuRaw);
+  readImuSample(imuRaw);
 
-  float ax = (imuRaw.ax - accelBiasX) / imu::ACCEL_SCALE;
-  float ay = (imuRaw.ay - accelBiasY) / imu::ACCEL_SCALE;
-  float az = (imuRaw.az - accelBiasZ) / imu::ACCEL_SCALE;
-  float gx = (imuRaw.gx - gyroBiasX) / imu::GYRO_SCALE;
-  float gy = (imuRaw.gy - gyroBiasY) / imu::GYRO_SCALE;
-  float gz = (imuRaw.gz - gyroBiasZ) / imu::GYRO_SCALE;
+  float ax = (imuRaw.ax - accelBiasX) / ACCEL_SCALE;
+  float ay = (imuRaw.ay - accelBiasY) / ACCEL_SCALE;
+  float az = (imuRaw.az - accelBiasZ) / ACCEL_SCALE;
+  float gx = (imuRaw.gx - gyroBiasX) / GYRO_SCALE;
+  float gy = (imuRaw.gy - gyroBiasY) / GYRO_SCALE;
+  float gz = (imuRaw.gz - gyroBiasZ) / GYRO_SCALE;
 
   float accelRoll = atan2f(ay, az) * 57.2958f;
   float accelPitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2958f;
@@ -362,21 +365,18 @@ void updateAttitude(float dt) {
 
 void updateBarometer() {
   const uint32_t now = millis();
-  if (now - lastBaroConversionMillis < 10) {
+  if (now - lastBaroSampleMillis < 25) {
     return;
   }
-  lastBaroConversionMillis = now;
+  lastBaroSampleMillis = now;
 
-  if (baroRequestingPressure) {
-    baroLastRaw = baroReadADC(); // D1 pressure
-    baroWrite(baro::CMD_CONVERT_D2);
-    baroRequestingPressure = false;
-  } else {
-    uint32_t d2 = baroReadADC(); // temperature
-    float altitude = baroCalculateAltitude(baroLastRaw, d2);
-    altitudeMeters = 0.95f * altitudeMeters + 0.05f * altitude;
-    baroWrite(baro::CMD_CONVERT_D1);
-    baroRequestingPressure = true;
+  if (ms5611Read(ms5611)) {
+    float pressurePa = toPascal(ms5611.getPressure());
+    lastTemperatureC = ms5611.getTemperature();
+    if (pressurePa > 10000.0f) {
+      float altitude = 44330.0f * (1.0f - powf(pressurePa / basePressurePa, 0.1903f));
+      altitudeMeters = 0.95f * altitudeMeters + 0.05f * altitude;
+    }
   }
 }
 
@@ -484,15 +484,16 @@ void updateIndicators() {
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  Wire.setClock(400000); // fast-mode I2C for sensors
   pinMode(PIN_IMU_INT, INPUT);
   pinMode(PIN_STATUS_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   setBuzzer(false);
   digitalWrite(PIN_STATUS_LED, LOW);
 
-  imuInit();
+  bool imuOk = initImu();
   calibrateIMU();
-  baroInit();
+  bool baroOk = initBarometer();
 
   initRadio();
 
@@ -504,6 +505,10 @@ void setup() {
 
   lastPacketMicros = micros();
   failsafeActive = true;
+
+  if (!imuOk || !baroOk) {
+    Serial.println(F("[WARN] Sensor init failed. Check wiring and addresses."));
+  }
 }
 
 void loop() {

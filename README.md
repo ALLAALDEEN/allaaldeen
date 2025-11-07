@@ -44,8 +44,11 @@ Power both boards from stable 5 V sources. Add 10 µF capacitors across the 
 1. Install the **Arduino IDE** (v2 recommended) or use the Arduino CLI.
 2. Install required libraries through the Library Manager or git:
    - `RF24` by TMRh20.
-   - `Servo` is bundled with the IDE.
-3. Optional (for debugging): `Serial Monitor` at 115200 baud on the flight controller.
+   - `Servo` (bundled with the IDE).
+   - `I2Cdev` and `MPU6050` from the I2Cdevlib collection (by Electronic Cats / Jeff Rowberg).
+   - `MS5611` by Rob Tillaart (or an equivalent that exposes `MS5611.h`).
+3. Confirm the sensors share the SDA/SCL bus (`A4/A5`) and keep their default I²C addresses (`MPU6050` = `0x68`, `MS5611` = `0x77`). If you change either address, update the constants in `flight_controller.ino`.
+4. Optional (for debugging): `Serial Monitor` at 115200 baud on the flight controller.
 
 ---
 
@@ -129,6 +132,7 @@ Calibration runs automatically at boot while the frame is stationary and level:
 ## 8. Safety & Tuning Notes
 
 - **Failsafe:** If radio packets stop for >200 ms, motors fall back to idle and the buzzer pulses.
+- **RF Channel:** Both sketches default to channel `115` (`RADIO_CHANNEL` constant). Change this value in **both** files if you need to avoid interference.
 - **PID Tuning:** Default gains are conservative. Adjust `rollPid`, `pitchPid`, and `yawPid` values in the flight controller sketch to suit your frame and motor/prop combination.
 - **Altitude Hold Placeholder:** Barometer data is filtered but not yet tied into throttle control. Use `aux1`/`aux2` or a button to implement your own hold logic.
 - **LED/Buzzer:** LED is steady when armed, slow blink disarmed, fast blink + buzzer in failsafe.
