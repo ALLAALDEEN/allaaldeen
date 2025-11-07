@@ -33,6 +33,8 @@
 #include <RF24.h>
 #include <Servo.h>
 
+#include "../shared/RcPacket.h"
+
 // ---------------------------------------------------------------------------
 // Hardware pin definitions
 // ---------------------------------------------------------------------------
@@ -66,19 +68,6 @@ const uint8_t MS5611_I2C_ADDRESS = 0x77;
 
 MPU6050 imu(MPU6050_I2C_ADDRESS);
 MS5611 ms5611;
-
-struct __attribute__((packed)) RcPacket {
-  uint32_t sequence;
-  uint16_t throttle;   // 0..1000
-  int16_t roll;        // -500..500 (scaled degrees reference)
-  int16_t pitch;       // -500..500
-  int16_t yaw;         // -500..500 (yaw rate command)
-  int16_t aux1;        // -500..500 (pot 1 centered)
-  int16_t aux2;        // -500..500 (pot 2 centered)
-  uint8_t buttons;     // bits 0..3 = buttons 1..4, bit set = pressed
-  uint8_t switches;    // bit0 = SW1 (arming), bit1 = SW2 (mode)
-  uint16_t checksum;
-};
 
 // ---------------------------------------------------------------------------
 // Helper templates to gracefully support multiple MS5611 library variants
@@ -216,15 +205,6 @@ uint32_t lastBaroSampleMillis = 0;
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
-uint16_t computeChecksum(const RcPacket &packet) {
-  const uint8_t *ptr = reinterpret_cast<const uint8_t *>(&packet);
-  uint16_t sum = 0;
-  for (size_t i = 0; i < sizeof(RcPacket) - sizeof(packet.checksum); ++i) {
-    sum += ptr[i];
-  }
-  return sum;
-}
-
 template <typename T> T clamp(T value, T minVal, T maxVal) {
   if (value < minVal) return minVal;
   if (value > maxVal) return maxVal;

@@ -4,6 +4,7 @@ This workspace contains two Arduino sketches that together form a basic 2.4 GH
 
 - `flight_controller/flight_controller.ino` — runs on the drone-side Arduino Nano, handles attitude estimation, PID motor control, nRF24L01+ telemetry reception, and safety logic.
 - `rc_transmitter/rc_transmitter.ino` — runs on the handheld Arduino Nano, reads sticks/switches/pots/buttons and continuously transmits command packets to the aircraft.
+- `shared/RcPacket.h` — shared radio packet definition and checksum helper used by both sketches (keep this file alongside the two project folders when copying to your Arduino sketchbook).
 
 Both sketches target Arduino Nano hardware (ATmega328P @ 16 MHz) and require the [TMRh20 RF24](https://github.com/nRF24/RF24) library.
 

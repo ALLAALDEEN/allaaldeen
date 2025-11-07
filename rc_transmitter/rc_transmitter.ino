@@ -21,6 +21,8 @@
 #include <SPI.h>
 #include <RF24.h>
 
+#include "../shared/RcPacket.h"
+
 const uint8_t PIN_RF_CE = 9;
 const uint8_t PIN_RF_CSN = 10;
 
@@ -54,30 +56,8 @@ T clamp(T value, T minVal, T maxVal) {
   return value;
 }
 
-struct __attribute__((packed)) RcPacket {
-  uint32_t sequence;
-  uint16_t throttle;   // 0..1000
-  int16_t roll;        // -500..500
-  int16_t pitch;       // -500..500
-  int16_t yaw;         // -500..500
-  int16_t aux1;        // -500..500 (pot 1)
-  int16_t aux2;        // -500..500 (pot 2)
-  uint8_t buttons;     // bitmask buttons D4..D7
-  uint8_t switches;    // bit0:SW1, bit1:SW2, bit2:LeftSel, bit3:RightSel
-  uint16_t checksum;
-};
-
 uint32_t sequenceCounter = 0;
 uint32_t lastSendMillis = 0;
-
-uint16_t computeChecksum(const RcPacket &packet) {
-  const uint8_t *ptr = reinterpret_cast<const uint8_t *>(&packet);
-  uint16_t sum = 0;
-  for (size_t i = 0; i < sizeof(RcPacket) - sizeof(packet.checksum); ++i) {
-    sum += ptr[i];
-  }
-  return sum;
-}
 
 int16_t mapAxisToSigned(int rawValue, int deadband = 20) {
   int centered = rawValue - 512;
