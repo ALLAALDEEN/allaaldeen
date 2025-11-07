@@ -34,6 +34,10 @@
 
 #include "../shared/RcPacket.h"
 
+// Forward declarations so Arduino's auto-prototyper recognises custom types
+struct ImuRawSample;
+struct PIDState;
+
 // ---------------------------------------------------------------------------
 // Hardware pin definitions
 // ---------------------------------------------------------------------------
@@ -187,7 +191,14 @@ void readImuSample(ImuRawSample &sample) {
 }
 
 bool initBarometer() {
+#if defined(MS5611_LIB_VERSION)
+  ms5611.setAddress(MS5611_I2C_ADDRESS);
+#endif
+#if defined(MS5611_LIB_VERSION) || defined(MS5611_H)
+  bool ok = ms5611.begin();
+#else
   bool ok = ms5611.begin(MS5611_I2C_ADDRESS);
+#endif
 #if defined(MS5611_OSR_ULTRA_HIGH)
   ms5611.setOversampling(MS5611_OSR_ULTRA_HIGH);
 #elif defined(MS5611_ULTRA_HIGH)
